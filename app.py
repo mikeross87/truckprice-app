@@ -12,6 +12,7 @@ st.set_page_config(page_title="Truck Price Model", layout="wide")
 # ----------------------------
 # Model location (MLflow artifact)
 # ----------------------------
+# Commit your MLflow model folder at repo root as ./model, or set MODEL_URI env.
 MODEL_URI = os.getenv("MODEL_URI", "./model")
 
 # ----------------------------
@@ -183,7 +184,7 @@ def predict_logprice(df_features: pd.DataFrame) -> np.ndarray:
     return np.asarray(preds).reshape(-1)
 
 # ----------------------------
-# UI
+# Sidebar & session-state defaults
 # ----------------------------
 st.title("🚛 Truck Price Prediction")
 
@@ -197,45 +198,79 @@ st.sidebar.markdown("""
 - Use *Batch Score* for CSVs.
 """)
 
+# Single Prediction defaults (persist in session)
+DEFAULTS = {
+    "sp_year": 2017, "sp_mileage": 750000, "sp_hp": 450, "sp_bunks": 1,
+    "sp_manufacturer": "FREIGHTLINER", "sp_model": "CASCADIA 125",
+    "sp_sleeper": "Mid Roof Sleeper", "sp_apu": False,
+    "sp_trans": "Eaton Fuller", "sp_tr_type": "Manual", "sp_tr_make": "EATON-FULLER",
+    "sp_engine_make": "DETROIT", "sp_engine_model": "DD15", "sp_state": "MO",
+}
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
 tab1, tab2, tab3 = st.tabs(["Single Prediction", "Compare Two", "Batch Score CSV"])
 
 # ----------------------------
-# Tab 1: Single Prediction
+# Tab 1: Single Prediction (form to avoid rerun resets)
 # ----------------------------
 with tab1:
     st.subheader("Single Prediction")
 
-    colA, colB, colC, colD = st.columns(4)
-    with colA:
-        year = st.number_input("Year", min_value=1990, max_value=2030, value=2017, step=1)
-        mileage = st.number_input("Mileage (mi)", min_value=0, value=750000, step=1000)
-        horsepower = st.number_input("Horsepower", min_value=200, max_value=800, value=450, step=10)
-        bunk_count = st.selectbox("Bunk count", [0,1,2], index=1)
-    with colB:
-        manufacturer = st.text_input("Manufacturer", "FREIGHTLINER")
-        truck_model = st.text_input("Model", "CASCADIA 125")  # renamed
-        sleeper_type_raw = st.selectbox("Sleeper type", ["Raised Roof Sleeper","Mid Roof Sleeper","Flat Top Sleeper","Other"], index=1)
-        has_apu_bool = st.checkbox("Has APU", value=False)
-    with colC:
-        transmission = st.text_input("Transmission", "Eaton Fuller")
-        transmission_type = st.text_input("Transmission Type", "Manual")
-        transmission_make = st.text_input("Transmission Make", "EATON-FULLER")
-    with colD:
-        engine_make = st.text_input("Engine Make", "DETROIT")
-        engine_model = st.text_input("Engine Model", "DD15")
-        state = st.text_input("State (2-letter)", "MO")
+    with st.form("single_form", clear_on_submit=False):
+        colA, colB, colC, colD = st.columns(4)
 
-    if st.button("Predict Price"):
-        X = featurize_single(year, mileage, horsepower, bunk_count,
-                             manufacturer, truck_model, sleeper_type_raw,
-                             transmission, transmission_type, transmission_make,
-                             engine_make, engine_model, state, has_apu_bool)
+        with colA:
+            st.number_input("Year", 1990, 2030, key="sp_year", step=1)
+            st.number_input("Mileage (mi)", 0, 2_000_000, key="sp_mileage", step=1000)
+            st.number_input("Horsepower", 200, 800, key="sp_hp", step=10)
+            bunk_options = [0, 1, 2]
+            idx = bunk_options.index(st.session_state.sp_bunks) if st.session_state.sp_bunks in bunk_options else 1
+            st.selectbox("Bunk count", bunk_options, index=idx, key="sp_bunks")
+
+        with colB:
+            st.text_input("Manufacturer", key="sp_manufacturer")
+            st.text_input("Model", key="sp_model")
+            sleeper_opts = ["Raised Roof Sleeper","Mid Roof Sleeper","Flat Top Sleeper","Other"]
+            idx = sleeper_opts.index(st.session_state.sp_sleeper) if st.session_state.sp_sleeper in sleeper_opts else 1
+            st.selectbox("Sleeper type", sleeper_opts, index=idx, key="sp_sleeper")
+            st.checkbox("Has APU", key="sp_apu")
+
+        with colC:
+            st.text_input("Transmission", key="sp_trans")
+            st.text_input("Transmission Type", key="sp_tr_type")
+            st.text_input("Transmission Make", key="sp_tr_make")
+
+        with colD:
+            st.text_input("Engine Make", key="sp_engine_make")
+            st.text_input("Engine Model", key="sp_engine_model")
+            st.text_input("State (2-letter)", key="sp_state")
+
+        submitted = st.form_submit_button("Predict Price")
+
+    if submitted:
+        X = featurize_single(
+            st.session_state.sp_year,
+            st.session_state.sp_mileage,
+            st.session_state.sp_hp,
+            st.session_state.sp_bunks,
+            st.session_state.sp_manufacturer,
+            st.session_state.sp_model,
+            st.session_state.sp_sleeper,
+            st.session_state.sp_trans,
+            st.session_state.sp_tr_type,
+            st.session_state.sp_tr_make,
+            st.session_state.sp_engine_make,
+            st.session_state.sp_engine_model,
+            st.session_state.sp_state,
+            st.session_state.sp_apu,
+        )
         try:
-            pred_log = predict_logprice(X)      # model predicts log(price)
-            y_pred = np.exp(pred_log)           # convert back to dollars
+            pred_log = predict_logprice(X)
+            y_pred = np.exp(pred_log)
             price = float(y_pred[0])
             st.success(f"Predicted price: **${price:,.0f}**")
-
             lo, hi = price*(1 - mape_pct/100.0), price*(1 + mape_pct/100.0)
             st.caption(f"Approx. ±MAPE band: ${lo:,.0f} – ${hi:,.0f} (display only)")
             st.write("Features sent to model:")
