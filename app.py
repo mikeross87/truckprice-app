@@ -6,20 +6,16 @@ import pandas as pd
 import streamlit as st
 import mlflow
 
-# Streamlit page config first
+# Configure page
 st.set_page_config(page_title="Truck Price Model", layout="wide")
 
 # ----------------------------
-# Config: where to load model
+# Model location (MLflow artifact)
 # ----------------------------
-# Option A: Set MODEL_URI to a local MLflow model folder you committed:
-#   export MODEL_URI="./model"
-# Option B: Point to registry:
-#   export MODEL_URI="models:/truckprice-xgb/1"
 MODEL_URI = os.getenv("MODEL_URI", "./model")
 
 # ----------------------------
-# Feature helpers (match training)
+# Helpers (must match training)
 # ----------------------------
 def engine_family(s):
     t = (s or "").lower()
@@ -66,12 +62,10 @@ SELECTED_FEATURES = [
 ]
 
 def _ensure_feature_frame(row_dict_or_df) -> pd.DataFrame:
-    """Return a DataFrame with exactly SELECTED_FEATURES in the right order."""
     if isinstance(row_dict_or_df, dict):
         df = pd.DataFrame([row_dict_or_df])
     else:
         df = row_dict_or_df.copy()
-    # make sure all expected columns exist
     for k in SELECTED_FEATURES:
         if k not in df.columns:
             df[k] = (
@@ -80,12 +74,11 @@ def _ensure_feature_frame(row_dict_or_df) -> pd.DataFrame:
                             "transmission_make","state"}
                 else np.nan
             )
-    # order them
     return df.reindex(columns=SELECTED_FEATURES, copy=False)
 
 def featurize_single(
     year:int, mileage:float, horsepower:float, bunk_count:int,
-    manufacturer:str, model:str, sleeper_type_raw:str,
+    manufacturer:str, model_text:str, sleeper_type_raw:str,
     transmission:str, transmission_type:str, transmission_make:str,
     engine_make:str, engine_model:str, state:str, has_apu_bool:bool
 ) -> pd.DataFrame:
@@ -101,7 +94,7 @@ def featurize_single(
     log_mileage = np.log1p(mileage) if mileage == mileage else np.nan
     miles_per_year = (mileage / max(age_years, 0.5)) if (mileage == mileage and age_years == age_years) else np.nan
 
-    model_series, model_variant_num = model_series_and_variant(model)
+    model_series, model_variant_num = model_series_and_variant(model_text)
     sleeper_type = sleeper_norm(sleeper_type_raw)
     engine_fam = engine_family(engine_make if (engine_make or "").strip() else engine_model)
     trans_simple = transmission_simple_from(transmission, transmission_type)
@@ -128,10 +121,7 @@ def featurize_single(
     return _ensure_feature_frame(row)
 
 def featurize_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
-    """Batch featurization from raw scraped columns if present."""
     df = raw_df.copy()
-
-    # Ensure columns exist
     for c in ["year","mileage","horsepower","bunk_count","manufacturer","model","sleeper_type",
               "transmission","transmission_type","transmission_make","engine_make","engine_model",
               "state","has_apu"]:
@@ -150,7 +140,6 @@ def featurize_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     df["log_mileage"] = np.log1p(df["mileage"].fillna(0))
     df["miles_per_year"] = df["mileage"] / (df["age_years"].replace(0, 0.5))
 
-    # Categorical/derived
     df["manufacturer"] = df["manufacturer"].astype(str).str.upper()
     df["transmission_make"] = df["transmission_make"].astype(str).str.upper()
     df["state"] = df["state"].astype(str).str.upper()
@@ -175,29 +164,23 @@ def featurize_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     ]
 
     out = _ensure_feature_frame(df)
-    # Minimal numeric clean-up
     out["bunk_count"] = pd.to_numeric(out["bunk_count"], errors="coerce")
     return out
 
 # ----------------------------
-# Load model (cached)
+# Load MLflow model (cache) — use a distinct name
 # ----------------------------
 @st.cache_resource(show_spinner=True)
 def load_model(uri: str):
     return mlflow.pyfunc.load_model(uri)
 
-model = load_model(MODEL_URI)
+ml_model = load_model(MODEL_URI)
 
 def predict_logprice(df_features: pd.DataFrame) -> np.ndarray:
-    """Always return a 1D numpy array of log-price predictions."""
-    preds = model.predict(df_features)
-    # Coerce to 1D numpy array
-    if isinstance(preds, (list, tuple)):
-        preds = np.array(preds)
-    if isinstance(preds, pd.Series):
-        preds = preds.values
-    preds = np.asarray(preds).reshape(-1)
-    return preds
+    preds = ml_model.predict(df_features)
+    if isinstance(preds, (list, tuple)): preds = np.array(preds)
+    if isinstance(preds, pd.Series): preds = preds.values
+    return np.asarray(preds).reshape(-1)
 
 # ----------------------------
 # UI
@@ -210,8 +193,8 @@ mape_pct = st.sidebar.slider("Display ±MAPE band (%)", min_value=2.0, max_value
 st.sidebar.markdown("""
 **Tips**
 - Unknown categories are handled (One-Hot ignores unknowns).
-- Inputs are engineered to match training features.
-- Use *Batch Score* to price a CSV of scraped listings.
+- Inputs match your training features.
+- Use *Batch Score* for CSVs.
 """)
 
 tab1, tab2, tab3 = st.tabs(["Single Prediction", "Compare Two", "Batch Score CSV"])
@@ -230,7 +213,7 @@ with tab1:
         bunk_count = st.selectbox("Bunk count", [0,1,2], index=1)
     with colB:
         manufacturer = st.text_input("Manufacturer", "FREIGHTLINER")
-        model = st.text_input("Model", "CASCADIA 125")
+        truck_model = st.text_input("Model", "CASCADIA 125")  # renamed
         sleeper_type_raw = st.selectbox("Sleeper type", ["Raised Roof Sleeper","Mid Roof Sleeper","Flat Top Sleeper","Other"], index=1)
         has_apu_bool = st.checkbox("Has APU", value=False)
     with colC:
@@ -244,16 +227,15 @@ with tab1:
 
     if st.button("Predict Price"):
         X = featurize_single(year, mileage, horsepower, bunk_count,
-                             manufacturer, model, sleeper_type_raw,
+                             manufacturer, truck_model, sleeper_type_raw,
                              transmission, transmission_type, transmission_make,
                              engine_make, engine_model, state, has_apu_bool)
         try:
-            pred_log = predict_logprice(X)  # model predicts log(price)
-            y_pred = np.exp(pred_log)
+            pred_log = predict_logprice(X)      # model predicts log(price)
+            y_pred = np.exp(pred_log)           # convert back to dollars
             price = float(y_pred[0])
             st.success(f"Predicted price: **${price:,.0f}**")
 
-            # Simple uncertainty band (±MAPE)
             lo, hi = price*(1 - mape_pct/100.0), price*(1 + mape_pct/100.0)
             st.caption(f"Approx. ±MAPE band: ${lo:,.0f} – ${hi:,.0f} (display only)")
             st.write("Features sent to model:")
@@ -306,7 +288,6 @@ with tab3:
     st.subheader("Batch Score a CSV")
     st.caption("Upload a CSV with columns like: year, mileage, horsepower, bunk_count, manufacturer, model, sleeper_type, transmission, transmission_type, transmission_make, engine_make, engine_model, state, has_apu.")
 
-    # Offer a template download
     template = pd.DataFrame({
         "year":[2017], "mileage":[750000], "horsepower":[450], "bunk_count":[2],
         "manufacturer":["FREIGHTLINER"], "model":["CASCADIA 125"], "sleeper_type":["Mid Roof Sleeper"],
@@ -326,7 +307,6 @@ with tab3:
         st.write("Raw preview:")
         st.dataframe(raw.head(10))
 
-        # Optional: protect free tier from very large uploads
         MAX_ROWS = 10000
         if len(raw) > MAX_ROWS:
             st.warning(f"Trimming to first {MAX_ROWS} rows to keep things snappy on Streamlit Cloud.")
@@ -340,7 +320,6 @@ with tab3:
             out["predicted_price"] = preds
             st.success("Scored!")
             st.dataframe(out.head(20))
-            # Download
             csv = out.to_csv(index=False).encode("utf-8")
             st.download_button("Download results CSV", data=csv, file_name="scored_trucks.csv", mime="text/csv")
         except Exception as e:
