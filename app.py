@@ -6,18 +6,20 @@ import pandas as pd
 import streamlit as st
 import mlflow
 
-# Configure page
-st.set_page_config(page_title="Truck Price Model", layout="wide")
+# ---------------------------------------
+# Page config
+# ---------------------------------------
+st.set_page_config(page_title="Sleeper Truck Retail Price Prediction", layout="wide")
+st.title("Sleeper Truck Retail Price Prediction")
 
-# ----------------------------
+# ---------------------------------------
 # Model location (MLflow artifact)
-# ----------------------------
-# Commit your MLflow model folder at repo root as ./model, or set MODEL_URI env.
-MODEL_URI = os.getenv("MODEL_URI", "./model")
+# ---------------------------------------
+MODEL_URI = os.getenv("MODEL_URI", "./model")  # path to MLflow model folder in repo or models:/... URI
 
-# ----------------------------
-# Helpers (must match training)
-# ----------------------------
+# ---------------------------------------
+# Helpers (must match training logic)
+# ---------------------------------------
 def engine_family(s):
     t = (s or "").lower()
     if any(k in t for k in ["dd13","dd15","dd16","detroit"]): return "Detroit"
@@ -39,11 +41,12 @@ def model_series_and_variant(x):
     return base, num
 
 def transmission_simple_from(text_a, text_b):
+    # text_a = "Transmission" (we now pass ""), text_b = "Transmission Type"
     t = (text_a or "") + " " + (text_b or "")
     t = t.lower()
     if re.search(r"automatic|allison", t): return "Automatic"
     if re.search(r"automated|auto[- ]?shift|ultrashift|i[- ]?shift|m[- ]?drive|dt12", t): return "Automated Manual"
-    return "Manual"
+    return "Manual"  # default used during training as well
 
 def sleeper_norm(s):
     s = (s or "").lower()
@@ -77,17 +80,36 @@ def _ensure_feature_frame(row_dict_or_df) -> pd.DataFrame:
             )
     return df.reindex(columns=SELECTED_FEATURES, copy=False)
 
+def _to_float_or_nan(x):
+    try:
+        if x is None: return np.nan
+        s = str(x).strip()
+        if s == "": return np.nan
+        return float(s.replace(",", ""))
+    except Exception:
+        return np.nan
+
+def _to_int_or_nan(x):
+    try:
+        if x is None: return np.nan
+        s = str(x).strip()
+        if s == "": return np.nan
+        return int(float(s.replace(",", "")))
+    except Exception:
+        return np.nan
+
 def featurize_single(
-    year:int, mileage:float, horsepower:float, bunk_count:int,
-    manufacturer:str, model_text:str, sleeper_type_raw:str,
-    transmission:str, transmission_type:str, transmission_make:str,
-    engine_make:str, engine_model:str, state:str, has_apu_bool:bool
+    year, mileage, horsepower, bunk_count,
+    manufacturer, model_text, sleeper_type_raw,
+    transmission, transmission_type, transmission_make,
+    engine_make, engine_model, state, has_apu_bool
 ) -> pd.DataFrame:
-    year = int(year) if year else np.nan
-    mileage = float(mileage) if mileage is not None else np.nan
-    horsepower = float(horsepower) if horsepower is not None else np.nan
-    bunk_count = float(bunk_count) if bunk_count is not None else np.nan
-    has_apu = 1.0 if has_apu_bool else 0.0
+    # Convert flexible/blank inputs to numbers or NaN
+    year = _to_int_or_nan(year)
+    mileage = _to_float_or_nan(mileage)
+    horsepower = _to_float_or_nan(horsepower)
+    bunk_count = _to_float_or_nan(bunk_count)
+    has_apu = 1.0 if bool(has_apu_bool) else 0.0
 
     from datetime import date
     THIS_YEAR = date.today().year
@@ -95,10 +117,10 @@ def featurize_single(
     log_mileage = np.log1p(mileage) if mileage == mileage else np.nan
     miles_per_year = (mileage / max(age_years, 0.5)) if (mileage == mileage and age_years == age_years) else np.nan
 
-    model_series, model_variant_num = model_series_and_variant(model_text)
+    model_series, model_variant_num = model_series_and_variant(model_text or "")
     sleeper_type = sleeper_norm(sleeper_type_raw)
-    engine_fam = engine_family(engine_make if (engine_make or "").strip() else engine_model)
-    trans_simple = transmission_simple_from(transmission, transmission_type)
+    engine_fam = engine_family((engine_make or "").strip() or (engine_model or ""))
+    trans_simple = transmission_simple_from(transmission or "", transmission_type or "")
 
     row = {
         "age_years": age_years,
@@ -121,6 +143,7 @@ def featurize_single(
     }
     return _ensure_feature_frame(row)
 
+# (Batch featurizer kept for completeness; not used in this trimmed app view)
 def featurize_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     df = raw_df.copy()
     for c in ["year","mileage","horsepower","bunk_count","manufacturer","model","sleeper_type",
@@ -168,9 +191,9 @@ def featurize_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     out["bunk_count"] = pd.to_numeric(out["bunk_count"], errors="coerce")
     return out
 
-# ----------------------------
-# Load MLflow model (cache) — use a distinct name
-# ----------------------------
+# ---------------------------------------
+# Load MLflow model (cached)
+# ---------------------------------------
 @st.cache_resource(show_spinner=True)
 def load_model(uri: str):
     return mlflow.pyfunc.load_model(uri)
@@ -183,179 +206,96 @@ def predict_logprice(df_features: pd.DataFrame) -> np.ndarray:
     if isinstance(preds, pd.Series): preds = preds.values
     return np.asarray(preds).reshape(-1)
 
-# ----------------------------
-# Sidebar & session-state defaults
-# ----------------------------
-st.title("🚛 Truck Price Prediction")
-
-st.sidebar.header("Model")
-st.sidebar.write(f"Model URI: `{MODEL_URI}`")
-mape_pct = st.sidebar.slider("Display ±MAPE band (%)", min_value=2.0, max_value=20.0, value=6.7, step=0.1)
-st.sidebar.markdown("""
-**Tips**
-- Unknown categories are handled (One-Hot ignores unknowns).
-- Inputs match your training features.
-- Use *Batch Score* for CSVs.
-""")
-
-# Single Prediction defaults (persist in session)
+# ---------------------------------------
+# Session-state defaults (blank-friendly)
+# ---------------------------------------
 DEFAULTS = {
-    "sp_year": 2017, "sp_mileage": 750000, "sp_hp": 450, "sp_bunks": 1,
-    "sp_manufacturer": "FREIGHTLINER", "sp_model": "CASCADIA 125",
-    "sp_sleeper": "Mid Roof Sleeper", "sp_apu": False,
-    "sp_trans": "Eaton Fuller", "sp_tr_type": "Manual", "sp_tr_make": "EATON-FULLER",
-    "sp_engine_make": "DETROIT", "sp_engine_model": "DD15", "sp_state": "MO",
+    "sp_year": "", "sp_mileage": "", "sp_hp": "", "sp_bunks": "",
+    "sp_manufacturer": "", "sp_model": "",
+    "sp_sleeper": "", "sp_apu": False,
+    # we removed "Transmission" free text; we keep type + make:
+    "sp_tr_type": "", "sp_tr_make": "",
+    "sp_engine_make": "", "sp_engine_model": "", "sp_state": ""
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-tab1, tab2, tab3 = st.tabs(["Single Prediction", "Compare Two", "Batch Score CSV"])
+# Fixed display band (formerly slider on sidebar)
+MAPE_DISPLAY_PCT = 6.7
 
-# ----------------------------
-# Tab 1: Single Prediction (form to avoid rerun resets)
-# ----------------------------
-with tab1:
-    st.subheader("Single Prediction")
+# ---------------------------------------
+# Single Prediction (form: no rerun on each change)
+# ---------------------------------------
+with st.form("single_form", clear_on_submit=False):
+    st.markdown("Fill in what you know. Any field may be left blank.")
 
-    with st.form("single_form", clear_on_submit=False):
-        colA, colB, colC, colD = st.columns(4)
+    colA, colB, colC = st.columns(3)
 
-        with colA:
-            st.number_input("Year", 1990, 2030, key="sp_year", step=1)
-            st.number_input("Mileage (mi)", 0, 2_000_000, key="sp_mileage", step=1000)
-            st.number_input("Horsepower", 200, 800, key="sp_hp", step=10)
-            bunk_options = [0, 1, 2]
-            idx = bunk_options.index(st.session_state.sp_bunks) if st.session_state.sp_bunks in bunk_options else 1
-            st.selectbox("Bunk count", bunk_options, index=idx, key="sp_bunks")
+    with colA:
+        st.text_input("Year", key="sp_year", placeholder="e.g., 2017")
+        st.text_input("Mileage (mi)", key="sp_mileage", placeholder="e.g., 750000")
+        st.text_input("Horsepower", key="sp_hp", placeholder="e.g., 450")
+        st.text_input("Bunk count", key="sp_bunks", placeholder="0, 1, or 2")
 
-        with colB:
-            st.text_input("Manufacturer", key="sp_manufacturer")
-            st.text_input("Model", key="sp_model")
-            sleeper_opts = ["Raised Roof Sleeper","Mid Roof Sleeper","Flat Top Sleeper","Other"]
-            idx = sleeper_opts.index(st.session_state.sp_sleeper) if st.session_state.sp_sleeper in sleeper_opts else 1
-            st.selectbox("Sleeper type", sleeper_opts, index=idx, key="sp_sleeper")
-            st.checkbox("Has APU", key="sp_apu")
+    with colB:
+        st.text_input("Manufacturer", key="sp_manufacturer", placeholder="e.g., FREIGHTLINER")
+        st.text_input("Model", key="sp_model", placeholder="e.g., CASCADIA 125")
+        sleeper_opts = ["", "Raised Roof Sleeper", "Mid Roof Sleeper", "Flat Top Sleeper", "Other"]
+        # use selectbox for sleeper with a blank option
+        idx = sleeper_opts.index(st.session_state.sp_sleeper) if st.session_state.sp_sleeper in sleeper_opts else 0
+        st.selectbox("Sleeper type", sleeper_opts, index=idx, key="sp_sleeper",
+                     help="If unknown, leave blank. Examples: Mid Roof Sleeper, Raised Roof Sleeper, Flat Top Sleeper.")
+        st.checkbox("Has APU", key="sp_apu")
 
-        with colC:
-            st.text_input("Transmission", key="sp_trans")
-            st.text_input("Transmission Type", key="sp_tr_type")
-            st.text_input("Transmission Make", key="sp_tr_make")
-
-        with colD:
-            st.text_input("Engine Make", key="sp_engine_make")
-            st.text_input("Engine Model", key="sp_engine_model")
-            st.text_input("State (2-letter)", key="sp_state")
-
-        submitted = st.form_submit_button("Predict Price")
-
-    if submitted:
-        X = featurize_single(
-            st.session_state.sp_year,
-            st.session_state.sp_mileage,
-            st.session_state.sp_hp,
-            st.session_state.sp_bunks,
-            st.session_state.sp_manufacturer,
-            st.session_state.sp_model,
-            st.session_state.sp_sleeper,
-            st.session_state.sp_trans,
-            st.session_state.sp_tr_type,
-            st.session_state.sp_tr_make,
-            st.session_state.sp_engine_make,
-            st.session_state.sp_engine_model,
-            st.session_state.sp_state,
-            st.session_state.sp_apu,
+    with colC:
+        # Removed "Transmission" free text (duplicative). Keep Type + Make:
+        tr_type_opts = ["", "Manual", "Automated Manual", "Automatic"]
+        idx = tr_type_opts.index(st.session_state.sp_tr_type) if st.session_state.sp_tr_type in tr_type_opts else 0
+        st.selectbox(
+            "Transmission Type",
+            tr_type_opts,
+            index=idx,
+            key="sp_tr_type",
+            help="Manual (driver shifts); Automated Manual (AMT: UltraShift, DT12, I-Shift, mDRIVE); Automatic (torque-converter, e.g., Allison)."
         )
-        try:
-            pred_log = predict_logprice(X)
-            y_pred = np.exp(pred_log)
-            price = float(y_pred[0])
-            st.success(f"Predicted price: **${price:,.0f}**")
-            lo, hi = price*(1 - mape_pct/100.0), price*(1 + mape_pct/100.0)
-            st.caption(f"Approx. ±MAPE band: ${lo:,.0f} – ${hi:,.0f} (display only)")
-            st.write("Features sent to model:")
-            st.dataframe(X)
-        except Exception as e:
-            st.error(f"Prediction failed: {e}")
+        st.text_input(
+            "Transmission Make",
+            key="sp_tr_make",
+            placeholder="e.g., EATON-FULLER, ALLISON, DETROIT, VOLVO, MACK",
+            help="Brand/manufacturer. Examples: EATON-FULLER (many manuals/AMTs), ALLISON (automatics), DETROIT (DT12), VOLVO (I-SHIFT), MACK (mDRIVE)."
+        )
+        st.text_input("Engine Make", key="sp_engine_make", placeholder="e.g., DETROIT")
+        st.text_input("Engine Model", key="sp_engine_model", placeholder="e.g., DD15")
+        st.text_input("State (2-letter)", key="sp_state", placeholder="e.g., MO")
 
-# ----------------------------
-# Tab 2: Compare Two
-# ----------------------------
-with tab2:
-    st.subheader("Compare Two Trucks")
+    submitted = st.form_submit_button("Predict Price")
 
-    def input_block(prefix, container):
-        with container:
-            year = st.number_input(f"{prefix} Year", 1990, 2030, 2017, key=prefix+"y")
-            mileage = st.number_input(f"{prefix} Mileage", 0, 2_000_000, 750000, step=1000, key=prefix+"m")
-            hp = st.number_input(f"{prefix} HP", 200, 800, 450, step=10, key=prefix+"h")
-            bunks = st.selectbox(f"{prefix} Bunks", [0,1,2], index=1, key=prefix+"b")
-            man = st.text_input(f"{prefix} Manufacturer", "FREIGHTLINER", key=prefix+"man")
-            mod = st.text_input(f"{prefix} Model", "CASCADIA 125", key=prefix+"mod")
-            slp = st.selectbox(f"{prefix} Sleeper", ["Raised Roof Sleeper","Mid Roof Sleeper","Flat Top Sleeper","Other"], index=1, key=prefix+"sl")
-            apu = st.checkbox(f"{prefix} Has APU", value=False, key=prefix+"apu")
-            tr = st.text_input(f"{prefix} Transmission", "Eaton Fuller", key=prefix+"tr")
-            trt = st.text_input(f"{prefix} Transmission Type", "Manual", key=prefix+"trt")
-            trm = st.text_input(f"{prefix} Transmission Make", "EATON-FULLER", key=prefix+"trm")
-            engm = st.text_input(f"{prefix} Engine Make", "DETROIT", key=prefix+"em")
-            engmd = st.text_input(f"{prefix} Engine Model", "DD15", key=prefix+"emd")
-            stt = st.text_input(f"{prefix} State", "MO", key=prefix+"st")
-            return featurize_single(year, mileage, hp, bunks, man, mod, slp, tr, trt, trm, engm, engmd, stt, apu)
-
-    c1, c2 = st.columns(2)
-    X1 = input_block("A", c1)
-    X2 = input_block("B", c2)
-
-    if st.button("Compare"):
-        try:
-            p1 = float(np.exp(predict_logprice(X1))[0])
-            p2 = float(np.exp(predict_logprice(X2))[0])
-            st.success(f"A: **${p1:,.0f}**    |    B: **${p2:,.0f}**    →    Δ = **${(p2-p1):,.0f}** ({(p2/p1-1)*100:+.1f}%)")
-            both = pd.concat([X1.assign(_which="A", _pred=p1), X2.assign(_which="B", _pred=p2)], ignore_index=True)
-            st.dataframe(both)
-        except Exception as e:
-            st.error(f"Compare failed: {e}")
-
-# ----------------------------
-# Tab 3: Batch Score
-# ----------------------------
-with tab3:
-    st.subheader("Batch Score a CSV")
-    st.caption("Upload a CSV with columns like: year, mileage, horsepower, bunk_count, manufacturer, model, sleeper_type, transmission, transmission_type, transmission_make, engine_make, engine_model, state, has_apu.")
-
-    template = pd.DataFrame({
-        "year":[2017], "mileage":[750000], "horsepower":[450], "bunk_count":[2],
-        "manufacturer":["FREIGHTLINER"], "model":["CASCADIA 125"], "sleeper_type":["Mid Roof Sleeper"],
-        "transmission":["Eaton Fuller"], "transmission_type":["Manual"], "transmission_make":["EATON-FULLER"],
-        "engine_make":["DETROIT"], "engine_model":["DD15"], "state":["MO"], "has_apu":[False]
-    })
-    st.download_button(
-        "Download CSV template",
-        data=template.to_csv(index=False).encode("utf-8"),
-        file_name="truckprice_template.csv",
-        mime="text/csv"
+if submitted:
+    X = featurize_single(
+        st.session_state.sp_year,
+        st.session_state.sp_mileage,
+        st.session_state.sp_hp,
+        st.session_state.sp_bunks,
+        st.session_state.sp_manufacturer,
+        st.session_state.sp_model,
+        st.session_state.sp_sleeper,
+        "",  # transmission free-text (removed from UI)
+        st.session_state.sp_tr_type,
+        st.session_state.sp_tr_make,
+        st.session_state.sp_engine_make,
+        st.session_state.sp_engine_model,
+        st.session_state.sp_state,
+        st.session_state.sp_apu,
     )
-
-    up = st.file_uploader("Choose CSV", type=["csv"])
-    if up is not None:
-        raw = pd.read_csv(up)
-        st.write("Raw preview:")
-        st.dataframe(raw.head(10))
-
-        MAX_ROWS = 10000
-        if len(raw) > MAX_ROWS:
-            st.warning(f"Trimming to first {MAX_ROWS} rows to keep things snappy on Streamlit Cloud.")
-            raw = raw.head(MAX_ROWS)
-
-        Xb = featurize_dataframe(raw)
-        try:
-            preds_log = predict_logprice(Xb)
-            preds = np.exp(preds_log)
-            out = raw.copy()
-            out["predicted_price"] = preds
-            st.success("Scored!")
-            st.dataframe(out.head(20))
-            csv = out.to_csv(index=False).encode("utf-8")
-            st.download_button("Download results CSV", data=csv, file_name="scored_trucks.csv", mime="text/csv")
-        except Exception as e:
-            st.error(f"Batch scoring failed: {e}")
+    try:
+        pred_log = predict_logprice(X)
+        y_pred = np.exp(pred_log)
+        price = float(y_pred[0])
+        st.success(f"Predicted price: **${price:,.0f}**")
+        lo, hi = price*(1 - MAPE_DISPLAY_PCT/100.0), price*(1 + MAPE_DISPLAY_PCT/100.0)
+        st.caption(f"Approx. ±MAPE band: ${lo:,.0f} – ${hi:,.0f} (display only)")
+        with st.expander("View engineered features sent to the model"):
+            st.dataframe(X)
+    except Exception as e:
+        st.error(f"Prediction failed: {e}")
